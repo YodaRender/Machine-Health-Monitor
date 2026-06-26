@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Machine Health Monitor</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; background: #0f1117; color: #e0e0e0; padding: 24px; }
+    h1 { font-size: 1.4rem; margin-bottom: 4px; }
+    p.sub { color: #888; font-size: 0.85rem; margin-bottom: 24px; }
+    .card { background: #1a1d27; border: 1px solid #2a2d3a; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+    .form-row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field label { font-size: 0.78rem; color: #aaa; text-transform: uppercase; letter-spacing: 0.05em; }
+    select, input[type="file"] {
+      background: #0f1117; border: 1px solid #3a3d4a; border-radius: 6px;
+      color: #e0e0e0; padding: 8px 12px; font-size: 0.9rem;
+    }
+    button {
+      background: #4f8ef7; border: none; border-radius: 6px; color: #fff;
+      cursor: pointer; font-size: 0.9rem; padding: 9px 24px; font-weight: 600;
+    }
+    button:disabled { background: #2a3a5a; color: #666; cursor: not-allowed; }
+    .hint { font-size: 0.78rem; color: #666; margin-top: 6px; }
+    #status { font-size: 0.85rem; color: #aaa; margin-top: 10px; min-height: 20px; }
+    #status.error { color: #f77; }
+    #status.ok { color: #7f7; }
+    .metrics { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    .metric-card { background: #1a1d27; border: 1px solid #2a2d3a; border-radius: 8px; padding: 14px 20px; min-width: 150px; }
+    .metric-card .label { font-size: 0.75rem; color: #888; margin-bottom: 6px; }
+    .metric-card .value { font-size: 1.4rem; font-weight: 700; color: #4f8ef7; }
+    pre { background: #0f1117; border: 1px solid #2a2d3a; border-radius: 6px; padding: 14px; font-size: 0.8rem; color: #aaa; overflow-x: auto; white-space: pre-wrap; }
+    #results { display: none; }
+    .section-title { font-size: 0.8rem; color: #888; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Machine Health Monitor</h1>
+  <p class="sub">Isolation Forest + XGBoost inference dashboard</p>
+
+  <div class="card">
+    <div class="form-row">
+      <div class="field">
+        <label>Asset ID</label>
+        <select id="assetSelect"><option value="">Loading…</option></select>
+      </div>
+      <div class="field">
+        <label>Input CSV</label>
+        <input type="file" id="csvFile" accept=".csv" />
+      </div>
+      <div class="field">
+        <label>&nbsp;</label>
+        <button id="runBtn" onclick="runPipeline()" disabled>Run</button>
+      </div>
+    </div>
+    <div class="hint">Required columns: ts, asset, power_avg, cycle_time, items, status_time, status, alarm — rows must include the selected asset value.</div>
+    <div id="status">Upload a CSV to begin</div>
+  </div>
+
+  <div id="results">
+    <div class="metrics" id="metricsRow"></div>
+    <div class="card">
+      <div class="section-title">Health Score Timeline</div>
+      <canvas id="chart" height="70"></canvas>
+    </div>
+    <div class="card">
+      <div class="section-title">Report</div>
+      <pre id="report"></pre>
+    </div>
+  </div>
+
+<script>
+  let chartInst = null;
+
+  fetch('/assets')
+    .then(r => r.json())
+    .then(data => {
+      const sel = document.getElementById('assetSelect');
+      if (!data.assets.length) {
+        sel.innerHTML = '<option value="">No models found</option>';
+        return;
+      }
+      sel.innerHTML = data.assets.map(a => `<option value="${a}">Asset ${a}</option>`).join('');
+      checkReady();
+    })
+    .catch(() => {
+      document.getElementById('assetSelect').innerHTML = '<option value="0">Asset 0</option>';
+    });
+
+  document.getElementById('csvFile').addEventListener('change', checkReady);
+
+  function checkReady() {
+    const hasFile = !!document.getElementById('csvFile').files.length;
+    const hasAsset = !!document.getElementById('assetSelect').value;
+    document.getElementById('runBtn').disabled = !(hasFile && hasAsset);
+    if (hasFile) setStatus('Ready — ' + document.getElementById('csvFile').files[0].name, '');
+  }
+
+  function setStatus(msg, type) {
+    const el = document.getElementById('status');
+    el.textContent = msg;
+    el.className = type;
+  }
+
+  async function runPipeline() {
+    const file = document.getElementById('csvFile').files[0];
+    const assetId = document.getElementById('assetSelect').value;
+    if (!file || !assetId) return;
+
+    const btn = document.getElementById('runBtn');
+    btn.disabled = true;
+    setStatus('Running…', '');
+    document.getElementById('results').style.display = 'none';
+
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('asset_id', assetId);
+
+    try {
+      const resp = await fetch('/predict', { method: 'POST', body: fd });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || 'Server error');
+
+      renderMetrics(data);
+      renderChart(data.rows);
+      document.getElementById('report').textContent = data.summary;
+      document.getElementById('results').style.display = 'block';
+      setStatus(`Done — ${data.row_count.toLocaleString()} rows scored`, 'ok');
+    } catch (err) {
+      setStatus('Error: ' + err.message, 'error');
+    } finally {
+      document.getElementById('runBtn').disabled = false;
+    }
+  }
+
+  function renderMetrics(data) {
+    // Parse key numbers out of the summary string
+    const get = (label) => {
+      const m = data.summary.match(new RegExp(label + '\\s*:\\s*([\\d.]+)'));
+      return m ? m[1] : '—';
+    };
+    const items = [
+      { label: 'Rows Scored',      value: data.row_count.toLocaleString() },
+      { label: 'IF AUC',           value: get('IF\\s+AUC') },
+      { label: 'XGB AUC',          value: get('XGB AUC') },
+      { label: 'Alarm Events',     value: get('Alarm events') },
+      { label: 'Median Lead Time', value: get('Median lead') === '—' ? '—' : get('Median lead') + ' rows' },
+    ];
+    document.getElementById('metricsRow').innerHTML = items.map(i =>
+      `<div class="metric-card"><div class="label">${i.label}</div><div class="value">${i.value}</div></div>`
+    ).join('');
+  }
+
+  function renderChart(rows) {
+    if (!rows || !rows.length) return;
+    if (chartInst) chartInst.destroy();
+
+    const labels = rows.map(r => r.ts ? r.ts.substring(0, 16).replace('T', ' ') : '');
+    const health = rows.map(r => r.health_smooth != null ? +r.health_smooth.toFixed(2) : null);
+    const xgb    = rows.map(r => r.xgb_pre_alarm_prob != null ? +(r.xgb_pre_alarm_prob * 100).toFixed(2) : null);
+    const alarm  = rows.map(r => r.alarm ? 105 : null);
+    const alert  = rows.map(r => r.combined_alert ? 110 : null);
+
+    chartInst = new Chart(document.getElementById('chart').getContext('2d'), {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          { label: 'Health Score',       data: health, borderColor: '#4f8ef7', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+          { label: 'XGB Pre-alarm ×100', data: xgb,    borderColor: '#f7a94f', borderWidth: 1,   pointRadius: 0, tension: 0.3 },
+          { label: 'Alarm',              data: alarm,  borderColor: '#f74f4f', pointRadius: 3, pointBackgroundColor: '#f74f4f', borderWidth: 0, showLine: false },
+          { label: 'Combined Alert',     data: alert,  borderColor: '#c44ff7', pointRadius: 3, pointBackgroundColor: '#c44ff7', borderWidth: 0, showLine: false },
+        ]
+      },
+      options: {
+        animation: false, responsive: true,
+        interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { labels: { color: '#ccc', boxWidth: 12, font: { size: 11 } } } },
+        scales: {
+          x: { ticks: { color: '#666', maxTicksLimit: 12, maxRotation: 0 }, grid: { color: '#222' } },
+          y: { ticks: { color: '#aaa' }, grid: { color: '#222' }, min: 0, max: 115 }
+        }
+      }
+    });
+  }
+</script>
+</body>
+</html>
